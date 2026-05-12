@@ -54,7 +54,7 @@ def turtle_trading_system(df: pl.DataFrame,
     in_position = False
     entry_day_count = 0
     instant_cumulative_profit = 0.0
-    
+    position_value= 0.0
     for i in range(len(records)):
         row = records[i]
         buy_act = 0
@@ -79,7 +79,7 @@ def turtle_trading_system(df: pl.DataFrame,
                 # 買入支出：價格 * 數量 * (1 + 手續費)
                 profit = -(row["close"] * position * (1 + fee))
                 instant_cumulative_profit += profit
-                whole_asset = instant_cumulative_profit + row["close"] * position
+                position_value = row["close"] * position
                 
         else:
             entry_day_count += 1
@@ -90,31 +90,31 @@ def turtle_trading_system(df: pl.DataFrame,
                 # 賣出收入：價格 * 數量 * (1 - 手續費)
                 profit = (row["close"] * position * (1 - fee))
                 instant_cumulative_profit += profit
+                position_value = 0
             elif entry_day_count >= vertical_barrier:
                 sell_act = 1
                 vertical_barrier_act = 1  # 標記是垂直屏障平倉
                 in_position = False
                 profit = (row["close"] * position * (1 - fee))
                 instant_cumulative_profit += profit
-            whole_asset = instant_cumulative_profit
+                position_value = 0
         row.update({
             "buy_action": buy_act,
             "sell_action": sell_act,
             "vertical_barrier_exit": vertical_barrier_act,
             "profit": profit,
-            "whole_asset": whole_asset
+            "position_value": position_value
         })
-        print(f"date: {row['date']}  instant_cumulative_profit: {instant_cumulative_profit} vertical_barrier_act: {vertical_barrier_act} whole_asset: {whole_asset}")
+        print(f"date: {row['date']}  instant_cumulative_profit: {instant_cumulative_profit} vertical_barrier_act: {vertical_barrier_act} position_value: {position_value}")
     # 3. 轉回 Polars 並計算累計欄位                                
     result_df = pl.from_dicts(records)
     
     result_df = result_df.with_columns([
         pl.col("buy_action").cum_sum().alias("cumulative_buy_position"),
         pl.col("sell_action").cum_sum().alias("cumulative_sell_position"),
-        pl.col("profit").cum_sum().alias("cumulative_profit"),
-        pl.col("whole_asset").cum_sum().alias("cumulative_whole_asset")
+        pl.col("profit").cum_sum().alias("cumulative_profit")
     ])
-
+    print(result_df.columns)
     return result_df
 
 def plot_turtle_trading(result_df: pl.DataFrame):
@@ -124,7 +124,6 @@ def plot_turtle_trading(result_df: pl.DataFrame):
         row_heights=[0.7, 0.3],
         subplot_titles=["K線圖", "累計損益"]
     )
-
     # --- K線圖 ---
     fig.add_trace(go.Candlestick(
         x=result_df["date"],
@@ -196,7 +195,7 @@ def plot_turtle_trading(result_df: pl.DataFrame):
     # --- 累計資產曲線 ---
     fig.add_trace(go.Scatter(
         x=result_df["date"],
-        y=result_df["whole_asset"].cum_sum(),
+        y=result_df["position_value"]+result_df["profit"].cum_sum(),
         mode="lines",
         line=dict(color="green"),
         name="累計資產"
@@ -206,5 +205,33 @@ def plot_turtle_trading(result_df: pl.DataFrame):
         xaxis_rangeslider_visible=False,
         height=800
     )
-
+    fig.write_html("turtle_trading.html")   
     fig.show()
+def get_trade_signals(result_df: pl.DataFrame, symbol: str = "BTC-USDT-SWAP") :
+    trade_df = result_df.filter(
+        (pl.col("buy_action") == 1) | (pl.col("sell_action") == 1)
+    ).with_columns([
+        pl.lit(symbol).alias("symbol"),
+        pl.when(pl.col("buy_action") == 1)
+          .then(pl.lit("BUY"))
+          .otherwise(pl.lit("SELL"))
+          .alias("side"),
+        pl.when(pl.col("vertical_barrier_exit") == 1)
+          .then(pl.lit("Vertical Barrier"))
+          .when(pl.col("sell_action") == 1)
+          .then(pl.lit("Signal"))
+          .otherwise(pl.lit("-"))
+          .alias("exit_reason"),
+        (pl.col("close") * 0.003).alias("fee"),
+    ]).select([
+        "date",
+        "symbol",
+        "side",
+        "close",
+        "fee",
+        "profit",
+        "whole_asset",
+        "exit_reason",
+    ]).rename({"close": "price"})
+
+    return trade_df
