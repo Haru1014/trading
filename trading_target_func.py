@@ -26,6 +26,7 @@ def resample_to_daily(df: pl.DataFrame,inst_id: str = "BTC-USDT-SWAP") :
         pl.col("close").sort_by("ts").last(),
     ])
     .rename({"ts": "date"})) 
+    
     print(daily_df.sort("date").head(1))
     print(len(daily_df))
     print(daily_df["date"].min())
@@ -53,6 +54,10 @@ def calc_atr(df: pl.DataFrame, period: int = 20) -> pl.DataFrame:
     ])
     
     return df
+def calc_unit_size(own_capital, atr, close, invest_pct, min_position):
+    raw = own_capital * invest_pct / (atr + close)
+    unit_size = math.floor(raw / min_position) * min_position
+    return unit_size
 def gt(a, b):
     if isinstance(b, list):
         return any(a > x for x in b)
@@ -402,6 +407,221 @@ def turtle_trading_system_gold_standard(
         pl.col("profit").cum_sum().alias("cumulative_profit")
     ])
     return result_df
+
+def turtle_trading_system_full(
+        df: pl.DataFrame,
+        enter_term_sys1: int = 20,
+        enter_term_sys2: int = 55,
+        leave_term_sys1: int = 10,
+        leave_term_sys2: int = 20,
+        single_sys_unit_limit: int = 4,
+        both_sys_unit_limit: int = 6,
+        own_capital: float = 100000.0,
+        invest_pct: float = 0.01,
+        min_position: float = 0.001,
+        fee: float = 0.003,
+        atr_period: int = 20) -> pl.DataFrame:
+
+    # 1. 計算 ATR
+    df = calc_atr(df, period=atr_period)
+
+    # 2. 計算極值與出場線
+    df = df.with_columns([
+        pl.col("high").rolling_max(window_size=enter_term_sys1).shift(1).alias("last_enter_max_sys1"),
+        pl.col("high").rolling_max(window_size=enter_term_sys2).shift(1).alias("last_enter_max_sys2"),
+        pl.col("low").rolling_min(window_size=leave_term_sys1).shift(1).alias("last_leave_min_sys1"),
+        pl.col("low").rolling_min(window_size=leave_term_sys2).shift(1).alias("last_leave_min_sys2"),
+    ])
+
+    records = df.to_dicts()
+
+    # ── S1 狀態 ──
+    s1_in_position    = False
+    s1_units          = 0
+    s1_position       = 0.0
+    s1_total_cost     = 0.0
+    s1_last_add_price = 0.0
+    s1_stop_loss      = 0.0
+    s1_skip_next      = False
+    s1_entry_day      = 0
+
+    # ── S2 狀態 ──
+    s2_in_position    = False
+    s2_units          = 0
+    s2_position       = 0.0
+    s2_total_cost     = 0.0
+    s2_last_add_price = 0.0
+    s2_stop_loss      = 0.0
+    s2_entry_day      = 0
+
+    cumulative_profit = 0.0
+    
+    for i in range(len(records)):
+        row = records[i]
+       
+        s1_buy    = 0;  s1_sell  = 0
+        s2_buy    = 0;  s2_sell  = 0
+        s1_profit = 0.0
+        s2_profit = 0.0
+
+        atr            = row.get("ATR")
+        enter_max_sys1 = row.get("last_enter_max_sys1")
+        enter_max_sys2 = row.get("last_enter_max_sys2")
+        leave_min_sys1 = row.get("last_leave_min_sys1")
+        leave_min_sys2 = row.get("last_leave_min_sys2")
+        close          = row["close"]
+
+        # 跳過 rolling window 空值期
+        if any(v is None for v in [atr, enter_max_sys1, enter_max_sys2,
+                                    leave_min_sys1, leave_min_sys2]):
+            row.update({
+                "s1_buy": 0, "s1_sell": 0, "s1_profit": 0.0,
+                "s2_buy": 0, "s2_sell": 0, "s2_profit": 0.0,
+                "s1_units": 0, "s2_units": 0,
+                "s1_position": 0.0, "s2_position": 0.0,
+                "s1_position_value": 0.0, "s2_position_value": 0.0,
+                "s1_stop_loss": 0.0, "s2_stop_loss": 0.0,
+                "total_units": 0,
+                "whole_asset": cumulative_profit,
+                "cumulative_profit": cumulative_profit,
+            })
+            continue
+
+        # 每天重算 unit_size
+        unit_size   = calc_unit_size(own_capital, atr, close, invest_pct, min_position)
+        total_units = s1_units + s2_units
+
+        # =========================================
+        # S1 邏輯
+        # =========================================
+        if not s1_in_position:
+            if row["high"] > enter_max_sys1:
+                if s1_skip_next:
+                    s1_skip_next = False
+                else:
+                    if total_units + 1 <= both_sys_unit_limit:
+                        s1_in_position    = True
+                        s1_units          = 1
+                        s1_last_add_price = close
+                        s1_stop_loss      = close - 2 * atr
+                        s1_position       = unit_size
+                        cost              = close * unit_size * (1 + fee)
+                        s1_total_cost     = cost
+                        s1_profit         = -cost
+                        cumulative_profit += s1_profit
+                        s1_buy            = 1
+                        s1_entry_day      = 0
+                        total_units       = s1_units + s2_units
+        else:
+            s1_entry_day += 1
+
+            if row["low"] < leave_min_sys1 or close <= s1_stop_loss:
+                revenue           = close * s1_position * (1 - fee)
+                s1_profit         = revenue
+                cumulative_profit += s1_profit
+                s1_skip_next      = revenue > s1_total_cost
+                s1_in_position    = False
+                s1_sell           = 1
+                s1_units          = 0
+                s1_position       = 0.0
+                s1_total_cost     = 0.0
+                s1_stop_loss      = 0.0
+                total_units       = s1_units + s2_units
+            else:
+                if (s1_units < single_sys_unit_limit and
+                        total_units + 1 <= both_sys_unit_limit and
+                        close >= s1_last_add_price + 0.5 * atr):
+                    s1_units         += 1
+                    s1_last_add_price = close
+                    s1_stop_loss      = close - 2 * atr
+                    s1_position      += unit_size
+                    cost              = close * unit_size * (1 + fee)
+                    s1_total_cost    += cost
+                    s1_profit         = -cost
+                    cumulative_profit += s1_profit
+                    s1_buy            = 1
+                    total_units       = s1_units + s2_units
+
+        # =========================================
+        # S2 邏輯
+        # =========================================
+        if not s2_in_position:
+            if row["high"] > enter_max_sys2:
+                if total_units + 1 <= both_sys_unit_limit:
+                    s2_in_position    = True
+                    s2_units          = 1
+                    s2_last_add_price = close
+                    s2_stop_loss      = close - 2 * atr
+                    s2_position       = unit_size
+                    cost              = close * unit_size * (1 + fee)
+                    s2_total_cost     = cost
+                    s2_profit         = -cost
+                    cumulative_profit += s2_profit
+                    s2_buy            = 1
+                    s2_entry_day      = 0
+                    total_units       = s1_units + s2_units
+        else:
+            s2_entry_day += 1
+
+            if row["low"] < leave_min_sys2 or close <= s2_stop_loss:
+                revenue           = close * s2_position * (1 - fee)
+                s2_profit         = revenue
+                cumulative_profit += s2_profit
+                s2_in_position    = False
+                s2_sell           = 1
+                s2_units          = 0
+                s2_position       = 0.0
+                s2_total_cost     = 0.0
+                s2_stop_loss      = 0.0
+                total_units       = s1_units + s2_units
+            else:
+                if (s2_units < single_sys_unit_limit and
+                        total_units + 1 <= both_sys_unit_limit and
+                        close >= s2_last_add_price + 0.5 * atr):
+                    s2_units         += 1
+                    s2_last_add_price = close
+                    s2_stop_loss      = close - 2 * atr
+                    s2_position      += unit_size
+                    cost              = close * unit_size * (1 + fee)
+                    s2_total_cost    += cost
+                    s2_profit         = -cost
+                    cumulative_profit += s2_profit
+                    s2_buy            = 1
+                    total_units       = s1_units + s2_units
+
+        s1_position_value = close * s1_position if s1_in_position else 0.0
+        s2_position_value = close * s2_position if s2_in_position else 0.0
+        whole_asset       = cumulative_profit + s1_position_value + s2_position_value
+
+        row.update({
+            "s1_buy":             s1_buy,
+            "s1_sell":            s1_sell,
+            "s1_profit":          s1_profit,
+            "s1_units":           s1_units,
+            "s1_position":        s1_position,
+            "s1_position_value":  s1_position_value,
+            "s1_stop_loss":       s1_stop_loss,
+            "s2_buy":             s2_buy,
+            "s2_sell":            s2_sell,
+            "s2_profit":          s2_profit,
+            "s2_units":           s2_units,
+            "s2_position":        s2_position,
+            "s2_position_value":  s2_position_value,
+            "s2_stop_loss":       s2_stop_loss,
+            "total_units":        total_units,
+            "whole_asset":        whole_asset,
+            "profit": s1_profit + s2_profit,
+            "cumulative_profit":  cumulative_profit,
+            "buy_action":  1 if (s1_buy or s2_buy) else 0,
+            "sell_action": 1 if (s1_sell or s2_sell) else 0,
+            "whole_asset_plus_initial_fund": whole_asset + own_capital,
+        })
+
+    result_df = pl.from_dicts(records)
+    return result_df   
+
+
+
 def plot_turtle_trading(result_df: pl.DataFrame):
     
     fig = make_subplots(
@@ -913,6 +1133,32 @@ def sweep_params(daily_df: pl.DataFrame,
     fig.show()
    
     return result_df_all
+def _calc_trade_pnl(result_df: pl.DataFrame, buy_col: str, sell_col: str, profit_col: str):
+    """
+    把一系列的 buy/sell 配對，計算每筆交易的總 PnL。
+    一筆交易 = 第一個 buy 到下一個 sell 之間所有 profit 的加總。
+    """
+    buy_actions  = result_df[buy_col].to_numpy()
+    sell_actions = result_df[sell_col].to_numpy()
+    profits      = result_df[profit_col].to_numpy()
+
+    trade_pnl  = []
+    in_trade   = False
+    current_pnl = 0.0
+
+    for i in range(len(profits)):
+        if not in_trade:
+            if buy_actions[i] == 1:
+                in_trade    = True
+                current_pnl = profits[i]  # 第一筆買入（負值）
+        else:
+            current_pnl += profits[i]     # 加碼或持倉期間（0）或賣出（正值）
+            if sell_actions[i] == 1:
+                trade_pnl.append(current_pnl)
+                in_trade    = False
+                current_pnl = 0.0
+
+    return np.array(trade_pnl)
 def calc_win_rate(result_df: pl.DataFrame):
     profits = result_df["profit"].to_numpy()
     buy_actions  = result_df["buy_action"].to_numpy()
@@ -923,6 +1169,12 @@ def calc_win_rate(result_df: pl.DataFrame):
     trade_pnl = sell_profits[:n_trades] + buy_profits[:n_trades]
     win_rate = (trade_pnl > 0).sum() / n_trades if n_trades > 0 else 0
     return win_rate
+
+def calc_win_rate_full(result_df: pl.DataFrame):
+    s1_pnl = _calc_trade_pnl(result_df, "s1_buy", "s1_sell", "s1_profit")
+    s2_pnl = _calc_trade_pnl(result_df, "s2_buy", "s2_sell", "s2_profit")
+    all_pnl = np.concatenate([s1_pnl, s2_pnl])
+    return (all_pnl > 0).sum() / len(all_pnl) if len(all_pnl) > 0 else 0
 def calc_profit_loss_ratio(result_df: pl.DataFrame):
     profits = result_df["profit"].to_numpy()
     buy_actions  = result_df["buy_action"].to_numpy()
@@ -935,9 +1187,18 @@ def calc_profit_loss_ratio(result_df: pl.DataFrame):
     losses = trade_pnl[trade_pnl < 0]
     avg_win  = wins.mean()   if len(wins)   > 0 else 0
     avg_loss = losses.mean() if len(losses) > 0 else 0  # 負數
-
     profit_loss_ratio = avg_win / abs(avg_loss) if avg_loss != 0 else 0
     return profit_loss_ratio
+
+def calc_profit_loss_ratio_full(result_df: pl.DataFrame):
+    s1_pnl = _calc_trade_pnl(result_df, "s1_buy", "s1_sell", "s1_profit")
+    s2_pnl = _calc_trade_pnl(result_df, "s2_buy", "s2_sell", "s2_profit")
+    all_pnl = np.concatenate([s1_pnl, s2_pnl])
+    wins   = all_pnl[all_pnl > 0]
+    losses = all_pnl[all_pnl < 0]
+    avg_win  = wins.mean()   if len(wins)   > 0 else 0
+    avg_loss = losses.mean() if len(losses) > 0 else 0
+    return avg_win / abs(avg_loss) if avg_loss != 0 else 0
 def calc_expectancy(result_df: pl.DataFrame):
     profits      = result_df["profit"].to_numpy()
     buy_actions  = result_df["buy_action"].to_numpy()
@@ -956,6 +1217,24 @@ def calc_expectancy(result_df: pl.DataFrame):
     avg_loss = losses.mean() if len(losses) > 0 else 0.0  # 負數
     expectancy = (win_rate * avg_win) + (loss_rate * avg_loss)
     return expectancy
+def calc_expectancy_full(result_df: pl.DataFrame):
+    s1_pnl  = _calc_trade_pnl(result_df, "s1_buy", "s1_sell", "s1_profit")
+    s2_pnl  = _calc_trade_pnl(result_df, "s2_buy", "s2_sell", "s2_profit")
+    all_pnl = np.concatenate([s1_pnl, s2_pnl])
+
+    n_trades = len(all_pnl)
+    if n_trades == 0:
+        return 0.0
+
+    wins   = all_pnl[all_pnl > 0]
+    losses = all_pnl[all_pnl < 0]
+
+    win_rate  = len(wins) / n_trades
+    loss_rate = 1 - win_rate
+    avg_win   = wins.mean()   if len(wins)   > 0 else 0.0
+    avg_loss  = losses.mean() if len(losses) > 0 else 0.0
+
+    return (win_rate * avg_win) + (loss_rate * avg_loss)
 def mean_abs_gradient(df, metric_col, param_col, fixed_cols):
         grads = []
         for _, grp in df.sort([*fixed_cols, param_col]).group_by(fixed_cols):
@@ -1086,7 +1365,7 @@ def sweep_params_interactive(daily_df: pl.DataFrame, vertical_barrier: float = 3
             "leave_term":        leave_term,
             "win_rate":          win_rate,
             "profit_loss_ratio": profit_loss_ratio,
-            "expectancy":        expectancy/2000,
+            "expectancy":        expectancy,
             "mdd":               mdd,
             "final_whole_asset": float(whole_asset[-1]),
             "positive_rate":     positive_rate,
@@ -1527,16 +1806,14 @@ def evaluate_single_strategy_system1(result_df_all: pl.DataFrame) -> dict:
     verdicts["expectancy_mean"]   = round(float(exp_mean), 4)
     # =========================================
     # 5. 參數變動度（normalized gradient）
+    params = [c for c in result_df_all.columns if "enter_term" in c or "leave_term" in c]
     # =========================================
     GRAD_THRESHOLD = 0.10
     grad_results = {}
     for metric in ["final_whole_asset", "win_rate", "mdd", "positive_rate", "profit_loss_ratio", "expectancy"]:
         metric_mean = abs(df[metric].mean())
-        for param, fixed in [
-            ("enter_term_sys1", ["enter_term_sys2", "leave_term"]),
-            ("enter_term_sys2", ["enter_term_sys1", "leave_term"]),
-            ("leave_term",      ["enter_term_sys1", "enter_term_sys2"]),
-        ]:
+        for param in params:
+            fixed = [p for p in params if p != param]
             grad = mean_abs_gradient(result_df_all, metric, param, fixed)
             norm_grad = grad / metric_mean if metric_mean != 0 else 0.0
             key = f"{metric}__{param}"
@@ -1550,9 +1827,9 @@ def evaluate_single_strategy_system1(result_df_all: pl.DataFrame) -> dict:
     # 6. 參數與指標相關係數
     # =========================================
     available_metrics = [m for m in metrics if m in df.columns]
-    corr = df[params + available_metrics].corr().loc[params, available_metrics]
+    available_params  = [p for p in params if p in df.columns]
+    corr = df[available_params + available_metrics].corr().loc[available_params, available_metrics]
     verdicts["correlation"] = corr.round(3).to_dict()
-
     # =========================================
     # 7. 最終判定
     # =========================================
@@ -1955,3 +2232,180 @@ def find_plateau(result_df_all: pl.DataFrame,
         plateaus_list.append(plateaus[i])
 
     return plateaus_list
+def sweep_params_interactive_full(
+        daily_df: pl.DataFrame,
+        own_capital: float = 100000.0,
+        invest_pct: float = 0.01,
+        min_position: float = 0.001,
+        fee_rate: float = 0.003,
+        atr_period: int = 20,
+        single_sys_unit_limit: int = 4,
+        both_sys_unit_limit: int = 6,
+        initial_fund: float = 100000.0,
+):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    from itertools import product
+    from tqdm import tqdm
+
+    param_names = ["enter_term_sys1", "enter_term_sys2", "leave_term_sys1", "leave_term_sys2"]
+    param_defaults = {
+        "enter_term_sys1": (5,  30),
+        "enter_term_sys2": (31, 60),
+        "leave_term_sys1": (5,  20),
+        "leave_term_sys2": (5,  25),
+    }
+
+    print("\n可調整的參數：")
+    for i, name in enumerate(param_names):
+        lo, hi = param_defaults[name]
+        print(f"  [{i+1}] {name}  (預設範圍: {lo} ~ {hi})")
+
+    fixed_input = input("\n請輸入要固定的參數編號（多個用逗號分隔，不固定直接按 Enter）: ").strip()
+
+    fixed_indices = set()
+    if fixed_input:
+        for part in fixed_input.split(","):
+            part = part.strip()
+            if part.isdigit() and 1 <= int(part) <= len(param_names):
+                fixed_indices.add(int(part) - 1)
+
+    fixed_params = {}
+    free_ranges  = {}
+
+    print()
+    for i, name in enumerate(param_names):
+        lo_default, hi_default = param_defaults[name]
+        if i in fixed_indices:
+            val = input(f"  {name} 固定值: ").strip()
+            fixed_params[name] = int(val)
+        else:
+            lo = input(f"  {name} 起始值 (預設 {lo_default}): ").strip()
+            hi = input(f"  {name} 結束值 (預設 {hi_default}): ").strip()
+            free_ranges[name] = range(
+                int(lo) if lo else lo_default,
+                (int(hi) if hi else hi_default) + 1
+            )
+
+    sys1_vals   = [fixed_params["enter_term_sys1"]] if "enter_term_sys1" in fixed_params else list(free_ranges["enter_term_sys1"])
+    sys2_vals   = [fixed_params["enter_term_sys2"]] if "enter_term_sys2" in fixed_params else list(free_ranges["enter_term_sys2"])
+    leave1_vals = [fixed_params["leave_term_sys1"]] if "leave_term_sys1" in fixed_params else list(free_ranges["leave_term_sys1"])
+    leave2_vals = [fixed_params["leave_term_sys2"]] if "leave_term_sys2" in fixed_params else list(free_ranges["leave_term_sys2"])
+
+    valid_combinations = [
+        (sys1, sys2, leave1, leave2)
+        for sys1, sys2, leave1, leave2 in product(sys1_vals, sys2_vals, leave1_vals, leave2_vals)
+        if sys1 > leave1
+        and sys2 > leave2
+        and sys2 > sys1
+        and leave1 >= 5
+        and leave2 >= 5
+        and leave2 > leave1
+    ]
+
+    print(f"\n合法組合數: {len(valid_combinations)}")
+    if len(valid_combinations) == 0:
+        print("沒有合法組合，請重新確認參數範圍與約束條件。")
+        return None
+
+    results = []
+    for sys1, sys2, leave1, leave2 in tqdm(valid_combinations, desc="Sweeping params"):
+        result_df = turtle_trading_system_full(
+            daily_df,
+            enter_term_sys1=sys1,
+            enter_term_sys2=sys2,
+            leave_term_sys1=leave1,
+            leave_term_sys2=leave2,
+            single_sys_unit_limit=single_sys_unit_limit,
+            both_sys_unit_limit=both_sys_unit_limit,
+            own_capital=own_capital,
+            invest_pct=invest_pct,
+            min_position=min_position,
+            fee=fee_rate,
+            atr_period=atr_period,
+        )
+
+        position_values = (result_df["s1_position_value"] + result_df["s2_position_value"]).fill_null(0)
+        whole_asset     = result_df["whole_asset_plus_initial_fund"]
+
+        win_rate          = calc_win_rate_full(result_df)
+        profit_loss_ratio = calc_profit_loss_ratio_full(result_df)
+        expectancy        = calc_expectancy_full(result_df)
+        mdd               = calc_mdd(position_values, filter_zero=True)
+        positive_rate, median_asset, mean_asset = calc_whole_asset_stats(whole_asset)
+
+        results.append({
+            "enter_term_sys1":   sys1,
+            "enter_term_sys2":   sys2,
+            "leave_term_sys1":   leave1,
+            "leave_term_sys2":   leave2,
+            "win_rate":          win_rate,
+            "profit_loss_ratio": profit_loss_ratio,
+            "expectancy":        expectancy,
+            "mdd":               mdd,
+            "final_whole_asset": float(whole_asset[-1]),
+            "positive_rate":     positive_rate,
+            "median_asset":      median_asset,
+            "mean_asset":        mean_asset,
+        })
+
+    result_df_all = pl.DataFrame(results)
+
+    verdict = evaluate_single_strategy_system1(result_df_all)
+    result_df_all.write_csv("index_parameter_result_full.csv")
+
+    # ---- 畫圖 ----
+    metrics      = ["mdd", "win_rate", "final_whole_asset", "profit_loss_ratio", "expectancy"]
+    metric_names = ["MDD", "Win Rate", "Final Asset", "Profit Loss Ratio", "Expectancy"]
+    free_params  = [p for p in param_names if p not in fixed_params]
+
+    if len(free_params) == 2:
+        x_col, y_col = free_params[0], free_params[1]
+
+        def build_z(df, x_col, y_col, metric_col):
+            xs = sorted(df[x_col].unique().to_list())
+            ys = sorted(df[y_col].unique().to_list())
+            xi = {v: i for i, v in enumerate(xs)}
+            yi = {v: i for i, v in enumerate(ys)}
+            z  = np.full((len(ys), len(xs)), np.nan)
+            for row in df.to_dicts():
+                z[yi[row[y_col]]][xi[row[x_col]]] = row[metric_col]
+            return xs, ys, z
+
+        fig = make_subplots(
+            rows=2, cols=3,
+            specs=[[{'type': 'surface'}] * 3, [{'type': 'surface'}] * 3],
+            subplot_titles=metric_names,
+            horizontal_spacing=0.05,
+            vertical_spacing=0.08,
+        )
+        for idx, (metric, mname) in enumerate(zip(metrics, metric_names)):
+            row = idx // 3 + 1
+            col = idx % 3 + 1
+            xs, ys, z = build_z(result_df_all, x_col, y_col, metric)
+            fig.add_trace(
+                go.Surface(
+                    x=xs, y=ys, z=z,
+                    colorscale="Viridis",
+                    showscale=False,
+                    name=mname,
+                    hovertemplate=f"{x_col}=%{{x}}<br>{y_col}=%{{y}}<br>{metric}=%{{z:.4f}}<extra></extra>",
+                ),
+                row=row, col=col,
+            )
+        scene_kwargs = dict(xaxis_title=x_col, yaxis_title=y_col)
+        layout_scenes = {}
+        for idx, skey in enumerate(["scene", "scene2", "scene3", "scene4", "scene5"]):
+            layout_scenes[skey] = dict(**scene_kwargs, zaxis_title=metric_names[idx])
+
+        fixed_info = ", ".join([f"{k}={v}" for k, v in fixed_params.items()])
+        title_str  = f"Parameter Sweep Surface（full）｜固定參數：{fixed_info}" if fixed_info else "Parameter Sweep Surface（full）"
+
+        fig.update_layout(title=title_str, height=900, **layout_scenes)
+        fig.write_html("sweep_params_full.html")
+        fig.show()
+
+    else:
+        print(f"自由參數有 {len(free_params)} 個，超過2個不畫圖，請用 find_plateau 分析結果。")
+
+    return result_df_all

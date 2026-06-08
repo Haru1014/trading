@@ -20,11 +20,15 @@ print(df.head())
 daily_df = ttf.resample_to_daily(df,"BTC-USDT-SWAP")
 #trade_df_budget= ttf.turtle_trading_system_gold_standard(daily_df,20,55,10,30,10000,0.00000001,0.003,2000,True, 'system1')
 #trade_df_budget.write_csv("trade_df_budget20_10.csv")
-
+'''
+trade_df_budget=ttf.turtle_trading_system_full(daily_df,20,55,10,20,4,6,100000.0,0.01,min_position=0.00000001,fee= 0.003,atr_period = 20)
+trade_df_budget.write_csv("trade_df_full.csv")
+'''
 #ttf.plot_turtle_trading(result_df)
-#trade_df_signal=ttf.get_trade_signals(trade_df_budget)   
-#trade_df_signal.write_csv("trade_signals.csv")
-#ttf.evaluate_all(trade_df, daily_df, 0.003)
+
+sweep_df = ttf.sweep_params_interactive_full(daily_df,100000.0,0.01,0.001,0.003,20, 4,6,100000.0)
 print("Done")
-sweep_df =  ttf.sweep_params_interactive(daily_df, 60,1.0, 0.003, 'both')
+'''
+sweep_df =  ttf.sweep_params_interactive(daily_df,30,1.0, 0.003, 'system1')
 print("Done")
+'''
